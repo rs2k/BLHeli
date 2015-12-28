@@ -245,7 +245,7 @@ $NOMOD51
 ; - RC pulse timeout/skip counts and commutation times
 ; Timer 3 (500ns counts) always counts up and is used for
 ; - Commutation timeouts
-; PCA0 (500ns counts) always counts up and is used for
+; PCA0 (21/42ns counts) always counts up and is used for
 ; - RC pulse measurement
 ;
 ;**** **** **** **** ****
@@ -1872,10 +1872,10 @@ IF MODE == 2
 
 GOV_SPOOLRATE		EQU	1	; Number of steps for governor requested pwm per 32ms
 RCP_TIMEOUT_PPM	EQU	10	; Number of timer2H overflows (about 32ms) before considering rc pulse lost
-RCP_TIMEOUT		EQU 	24	; Number of timer2L overflows (about 128us) before considering rc pulse lost
+RCP_TIMEOUT		EQU 	255	; Number of timer2L overflows (about 128us) before considering rc pulse lost
 RCP_SKIP_RATE		EQU 	6	; Number of timer2L overflows (about 128us) before reenabling rc pulse detection
 RCP_MIN			EQU 	0	; This is minimum RC pulse length
-RCP_MAX			EQU 	255	; This is maximum RC pulse length
+RCP_MAX			EQU 	235	; This is maximum RC pulse length
 RCP_VALIDATE		EQU 	2	; Require minimum this pulse length to validate RC pulse
 RCP_STOP			EQU 	1	; Stop motor at or below this pulse length
 RCP_STOP_LIMIT		EQU 	250	; Stop motor if this many timer2H overflows (~32ms) are below stop limit
@@ -3219,23 +3219,54 @@ pca_int_fall:
 	mov	A, Temp2
 	subb	A, Rcp_Prev_Edge_H
 	mov	Temp2, A
-	jnb	Flags3.RCP_PWM_FREQ_12KHZ, ($+5)	; Is RC input pwm frequency 12kHz?
-	ajmp	pca_int_pwm_divide_done			; Yes - branch forward
+;multishot works with this code left in, but disabling during testing
+;	jnb	Flags3.RCP_PWM_FREQ_12KHZ, ($+5)	; Is RC input pwm frequency 12kHz?
+;	ajmp	pca_int_pwm_divide_done			; Yes - branch forward
+;
+;	jnb	Flags3.RCP_PWM_FREQ_8KHZ, ($+5)	; Is RC input pwm frequency 8kHz?
+;	ajmp	pca_int_pwm_divide_done			; Yes - branch forward
+;
+;	jnb	Flags3.RCP_PWM_FREQ_4KHZ, ($+5)	; Is RC input pwm frequency 4kHz?
+;	ajmp	pca_int_pwm_divide				; Yes - branch forward
+;
+;	jb	Flags2.RCP_PPM_ONESHOT125, ($+5)
+;	ajmp	pca_int_fall_not_oneshot
 
-	jnb	Flags3.RCP_PWM_FREQ_8KHZ, ($+5)	; Is RC input pwm frequency 8kHz?
-	ajmp	pca_int_pwm_divide_done			; Yes - branch forward
+;Multishot is 5us to 25us. Allowed is 3us to 28us
+;5us to 25 us needs to be converted to 125us to 250us
+;each clock count is 0.041666666666667 µs with MS; 0.0408163265306122 if 24.5
+;each clock count used to be 0.5 µs
+;A valid oneshot125 signal was 250 timer counts to 500 timer counts
+;A valid MS signal will now be  120 timer counts to 600 timer counts
+;We want to scale 250-500 to 120-600; 122 - 612 
+;If MS is enabled we do this:
 
-	jnb	Flags3.RCP_PWM_FREQ_4KHZ, ($+5)	; Is RC input pwm frequency 4kHz?
-	ajmp	pca_int_pwm_divide				; Yes - branch forward
+	mov	A, Temp2						; Divide by 2
+	clr	C
+	rrc	A
+	mov	Temp2, A
+	mov	A, Temp1					
+	rrc	A
+	mov	Temp1, A
+	;60-300; 61-306
 
-	jb	Flags2.RCP_PPM_ONESHOT125, ($+5)
-	ajmp	pca_int_fall_not_oneshot
+	clr	C
+    mov A,	Temp1     ;subtract 180
+    add A,	#180     ;Add the second low-byte to the accumulator
+    mov Temp5,	A     ;Move the answer to the low-byte of the result
+    mov A,	Temp2     ;Move the high-byte into the accumulator
+    addc A,	#0    ;Add the second high-byte to the accumulator, plus carry.
+    mov Temp6,	A     ;Move the answer to the high-byte of the result
+	;240 - 480
+	ajmp	pca_int_fall_check_range; consider this a valid MS signal - move to I_Temp5/6 ;testing only
+
 
 	mov	A, Temp2						; Oneshot125 - move to I_Temp5/6
 	mov	Temp6, A
 	mov	A, Temp1
 	mov	Temp5, A
 	ajmp	pca_int_fall_check_range
+
 
 pca_int_fall_not_oneshot:
 	mov	A, Temp2						; No - 2kHz. Divide by 2
@@ -3274,7 +3305,7 @@ pca_int_fall_check_range:
 	; Check if 2160us or above (in order to ignore false pulses)
 	clr	C
 	mov	A, Temp5						; Is pulse 2160us or higher?
-	subb	A, #28
+	subb	A, #130
 	mov	A, Temp6
 	subb A, #2
 	jc	($+4)						; No - proceed
@@ -3619,7 +3650,6 @@ beep_off:		; Fets off loop
 	djnz	Temp4,	beep
 	BpFET_off			; BpFET off
 	ret
-
 
 ;**** **** **** **** **** **** **** **** **** **** **** **** ****
 ;
@@ -6605,6 +6635,7 @@ lock_byte_ok:
 	; Disable the WDT.
 IF SIGNATURE_001 == 0f3h		
 	anl	PCA0MD, #NOT(40h)	; Clear watchdog enable bit
+	mov	PCA0MD, #0x08		; PCA0MD divider to Sysclock instead of sysclock / 12	
 ENDIF
 IF SIGNATURE_001 == 0f8h		
 	mov	WDTCN, #0DEh		; Disable watchdog
@@ -6774,6 +6805,10 @@ ENDIF
 	; Measure number of lipo cells
 	call Measure_Lipo_Cells			; Measure number of lipo cells
 	; Initialize RC pulse
+	anl	PCA0MD, #NOT(40h)			; Clear watchdog enable bit		;probably need to remove this duplicate code.
+IF SIGNATURE_001 == 0f3h											;probably need to remove this duplicate code.
+	orl PCA0MD, #0Eh				; PCA0MD divider to Sysclock instead of sysclock / 12 ;probably need to remove this duplicate code.
+ENDIF																;probably need to remove this duplicate code.
 	Rcp_Int_First 					; Enable interrupt and set to first edge
 	Rcp_Int_Enable		 			; Enable interrupt
 	Rcp_Clear_Int_Flag 				; Clear interrupt flag
@@ -6887,12 +6922,32 @@ ENDIF
 arming_initial_arm_check:
 	mov	A, Initial_Arm			; Yes - check if it is initial arm sequence
 	clr	C
-	subb	A, #1				; Is it the initial arm sequence?
+	subb	A, #1				; Is it the initial arm sequence? ;This portion of code fails with multishot
 	jnc 	arming_ppm_check		; Yes - proceed
 
 	jmp 	program_by_tx_checked	; No - branch
 
 arming_ppm_check:
+	;crazy beep for debugging. :)
+	clr 	EA							; Disable all interrupts
+	call beep_f1						; Signal that RC pulse is ready
+	call beep_f2
+	call beep_f3
+	call beep_f4
+	call beep_f3
+	call beep_f2
+	call beep_f1
+	call beep_f2
+	call beep_f3
+	call beep_f4
+	call beep_f3
+	call beep_f2
+	call beep_f1
+	call beep_f2
+	call beep_f3
+	call beep_f4
+	call beep_f3
+	setb	EA
 	jb	Flags2.RCP_PPM, throttle_high_cal_start	; If flag is set (PPM) - branch
 
 	; PWM tx program entry
